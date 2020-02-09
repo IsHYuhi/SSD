@@ -186,7 +186,7 @@ class VOCDataset(data.Dataset):
         self.transform_anno = transform_anno
 
     def __len__(self):
-        return len(self.img_liset)
+        return len(self.img_list)
 
     def __getitem__(self, index):
         im, gt, h, w = self.pull_item(index)
