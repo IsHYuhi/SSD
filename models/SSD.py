@@ -4,6 +4,8 @@ from itertools import product
 from math import sqrt
 import pandas as pd
 import torch.nn.init as init
+import torch.nn.functional as F
+from torch.autograd import Function
 
 def make_vgg():
     layers = []
@@ -78,6 +80,189 @@ def make_loc_conf(num_classes=21, bbox_aspect_num=[4, 6, 6, 6, 4, 4]):
 
     return nn.ModuleList(loc_layers), nn.ModuleList(conf_layers)
 
+
+def decode(loc, dbox_list):
+    """
+    DBox2BBox
+    [cx, cy, width, height] to [xmin, ymin, xmax, ymax]
+    Parameters
+    ----------
+    loc: [8732, 4]
+        [Δcx, Δcy, Δwidth, Δheight]
+
+    dbox_list: [8732, 4]
+        [cx, cy, width, height]
+
+    Returns
+    -------
+    boxes: [xmin, ymin, xmax, ymax]
+    """
+
+    #boxes: torch.Size([8732, 4])
+    boxes = torch.cat((
+        dbox_list[:, :2] + loc [:, :2] * 0.1 * dbox_list[:, 2:], #to (cx + Δcx*0.1*width, cy + Δcy*0.1*height): [8732, 2]
+        dbox_list[:, 2:] * torch.exp(loc[:, 2:] * 0.2)) #to (width + Δcx*0.1*cx, width + Δcy*0.1*cy): [8732, 2]
+        , dim=1)# to adjusted (cx, cy, width, height): [8732, 4]
+
+    #[cx, cy, width, height] to [xmin, ymin, xmax, ymax]
+    boxes[:, :2] -= boxes[:, 2:] / 2 #(cx, cy) to (xmin, ymin)
+    boxes[:, 2:] += boxes[:, :2] #(width, height) to (xmax, ymax)
+
+    return boxes
+
+def nm_suppression(boxes, scores, overlap=0.45, top_k=200):
+    """
+    Non-Maximum Suppression
+
+    Parameters
+    ----------
+    boxes: [the number of object over threshold, 4]
+
+    scores: [the number of object over threshold]
+
+    Returns
+    -------
+    keep: list
+        index of conf in the descending order
+    count: int
+        the number of object over threshold
+    """
+
+    # placeholder for return
+    count = 0
+    keep = scores.new(scores.size(0)).zero_().long()# all elements are zero
+
+    x1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x2 = boxes[:, 2]
+    y2 = boxes[:, 3]
+    area = torch.mul(x2-x1, y2-y1)
+
+    #copy for IoU
+    tmp_x1 = boxes.new()
+    tmp_y1 = boxes.new()
+    tmp_x2 = boxes.new()
+    tmp_y2 = boxes.new()
+    tmp_w = boxes.new()
+    tmp_h = boxes.new()
+
+    # sort scores in ascending order
+    v, idx = scores.sort(0)
+
+    #extract top_k index of BBox
+    idx = idx[-top_k:]
+
+    # loop while elements of idx is not 0
+    while idx.numel() > 0:
+        i = idx[-1] # index of maximum conf to i
+
+        keep[count] = i
+        count += 1
+
+        if idx.size(0) == 1:
+            break
+
+        # substract 1 because last index is stored in keep
+        idx = idx[:-1]
+
+        #eliminate BBox covered much with the BBox in the keep
+        torch.index_select(x1, 0, idx, out=tmp_x1)
+        torch.index_selsct(y1, 0, idx, out=tmp_y1)
+        torch.index_selsct(x2, 0, idx, out=tmp_x2)
+        torch.index_selsct(y2, 0, idx, out=tmp_y2)
+
+        #clamp current BBox=index conflict with i for all BBox
+        tmp_x1 = torch.clamp(tmp_x1, min=x1[i])
+        tmp_y1 = torch.clamp(tmp_x1, min=y1[i])
+        tmp_x2 = torch.clamp(tmp_x1, max=x2[i])
+        tmp_y2 = torch.clamp(tmp_x1, max=y2[i])
+
+        # w, h
+        tmp_w.resize_as_(tmp_x2)
+        tmp_h.resize_as_(tmp_y2)
+
+        tmp_w = torch.clamp(tmp_w, min=0.0)
+        tmp_h = torch.clamp(tmp_h, min=0.0)
+
+        #area
+        inter = tmp_w*tmp_h
+
+        #intersect in IoU
+        rem_areas = torch.index_select(area, 0, idx)# each BBox original area
+        union = (rem_areas - inter) + area[i]# and
+        IoU = inter/union
+
+        # leave idx IoU less than or equal to overlap
+        idx = idx[IoU.le(overlap)]# le = Less than or Equal to
+
+    return keep, count
+
+class Detect(Function):
+
+    def __init__(self, conf_thresh=0.01, top_k=200, nms_thresh=0.45):
+        self.softmax = nn.Softmax(dim=-1)# normalize conf with softmax
+
+        self.conf_thresh = conf_thresh
+
+        self.top_k = top_k
+
+        self.nms_thresh = nms_thresh # consider BBox for the same object where IoU >= thresh in nm_supression
+
+    def forward(self, loc_data, conf_data, dbox_list):
+        """
+        forward
+
+        Parameters
+        ----------
+        loc_data: [batch_num, 8732, 4]
+            offset information
+        conf_data: [batch_num, 8732, num_classes]
+            conf
+        dbox_list:[8732, 4]
+            DBox
+
+        Returns
+        -------
+        output: torch.Size([batch_num, num_classes, top_k, 5])
+            [batch_num, classes, top_k, BBox], BBox[xmin, ymin, xmax, ymax, class]
+        """
+
+        num_batch = loc_data.size(0)
+        num_dbox = loc_data.size(1)
+        num_classes = conf_data.size(2)
+
+        conf_data = self.softmax(conf_data)
+
+        output = torch.zeros(num_batch, num_classes, self.top_k, 5)
+
+        #conf_data: [batch_num, 8732, num_classes] => [batch_num, num_classes, 8732]
+        conf_preds = conf_data.transpose(2, 1)
+
+        for i in range(num_batch):
+
+            decoded_boxes = decode(loc_data[i], dbox_list)
+
+            #copy
+            conf_scores = conf_preds[i].clone()
+
+            for cl in range(1, num_classes):# from 1 because of backgroud:0
+
+                c_mask = conf_scores[cl].gt(self.conf_thresh)# gt means greater than
+
+                scores = conf_scores[cl][c_mask]
+
+                if scores.nelement() == 0: # sum of element
+                    continue
+
+                l_mask = c_mask.unsqueeze(1).expand_as(decoded_boxes)
+
+                boxes = decoded_boxes[l_mask].view(-1, 4)#decoded_boxes[lmask]:[n*4]=>[n,4]
+
+                ids, count = nm_suppression(boxes, scores, self.nms_thresh, self.top_k)
+
+                output[i, cl, :count] = torch.cat((scores[ids[:count]].unsqueeze(1), boxes[ids[:count]]), 1)
+
+        return output
 
 class L2Norm(nn.Module):
     def __init__(self, input_channels=512, scale=20):
@@ -171,6 +356,44 @@ class SSD(nn.Module):
 
         if phase == 'inference':
             self.detect = Detect()
+
+    def forward(self, x):
+        sources = []
+        loc = []
+        conf = []
+
+        for k in range(23):
+            x = self.vgg[k](x)
+
+        source1 = self.L2Norm(x)
+        sources.append(source1)
+
+        for k in range(23, len(self.vgg)):
+            x = self.vgg[k](x)
+
+        sources.append(x)
+
+        #source3~6
+        for k, v in enumerate(self.extras):
+            x = F.relu(v(x), inplace=True)
+            if k % 2 == 1:
+                sources.append(x)
+
+        for (x, l, c) in zip(sources, self.loc, self.conf):
+
+            loc.append(l(x).permute(0, 2, 3, 1).contiguous())# it shows variables located in memory when using view(), so contiguous sorted on memory.
+            conf.append(c(x).permute(0,2, 3, 1).contiguous())
+
+        loc = loc.view(loc.size(0), -1, 4)
+        conf = conf.view(conf.size(0), -1, self.num_classes)
+
+        output = (loc, conf, self.dbox_list)
+
+        if self.phase == "inference":
+            return self.detect(output[0], output[1], output[2])
+
+        else:
+            return output
 
 
 
